@@ -1,5 +1,6 @@
 const express = require('express');
 const session = require('express-session');
+require('dotenv').config();
 const { poolPromise, sql } = require('../db'); // Import DB connection
 
 const { ConfidentialClientApplication } = require('@azure/msal-node');
@@ -10,8 +11,8 @@ const router = express.Router();
 const msalConfig = {
     auth: {
         clientId: '644c879b-ba25-4fa0-b161-f76e20d072f8',
-        authority: 'https://login.microsoftonline.com/3ff66d1a-e933-442f-81f9-9bac89799968',
-        clientSecret: 'rWI8Q~loAbJwoL22TpxqvORB4_732qFr~RS3HbPH',
+        authority: process.env.MY_Auth,
+        clientSecret: process.env.MY_SECRET_KEY,
     },
     cache: {
         cacheLocation: 'memory',
