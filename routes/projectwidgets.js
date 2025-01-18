@@ -13,12 +13,11 @@ router.get('/:user_id/projects', async (req, res) => {
             SELECT 
                 Projects.id AS projectId, 
                 Projects.name AS projectName, 
-                Projects.style AS projectStyle, 
-                Projects.color AS projectColor,
+                Projects.style AS projectStyle,
                 Widgets.id AS widgetId,
                 Widgets.name AS widgetName,
                 Widgets.code AS widgetCode,
-                Widgets.style AS widgetStyle
+                Widgets.widgetNumber AS widgetNumber
             FROM Projects
             LEFT JOIN Widgets ON Projects.id = Widgets.project_id
             WHERE Projects.user_id = @user_id;
@@ -34,7 +33,7 @@ router.get('/:user_id/projects', async (req, res) => {
                 widgetId: row.widgetId,
                 widgetName: row.widgetName,
                 widgetCode: row.widgetCode,
-                widgetStyle: row.widgetStyle
+                widgetNumber: row.widgetNumber
             } : null;
 
             if (project) {
@@ -44,7 +43,6 @@ router.get('/:user_id/projects', async (req, res) => {
                     projectId: row.projectId,
                     projectName: row.projectName,
                     projectStyle: row.projectStyle,
-                    projectColor: row.projectColor,
                     widgets: widget ? [widget] : []
                 });
             }
@@ -58,5 +56,62 @@ router.get('/:user_id/projects', async (req, res) => {
     }
 });
 
+router.get('/:user_id/projects/:project_id', async (req, res) => {
+    const { user_id, project_id } = req.params;
+
+    try {
+        const pool = await poolPromise;
+
+        const query = `
+            SELECT 
+                Projects.id AS projectId, 
+                Projects.name AS projectName, 
+                Projects.style AS projectStyle,
+                Widgets.id AS widgetId,
+                Widgets.name AS widgetName,
+                Widgets.code AS widgetCode,
+                Widgets.widgetNumber AS widgetNumber
+            FROM Projects
+            LEFT JOIN Widgets ON Projects.id = Widgets.project_id
+            WHERE Projects.user_id = @user_id AND Projects.id = @project_id;
+        `;
+
+        const result = await pool.request()
+            .input('user_id', sql.Int, user_id)
+            .input('project_id', sql.Int, project_id)
+            .query(query);
+
+        if (result.recordset.length === 0) {
+            return res.status(404).json({ message: 'Project not found or does not belong to the user' });
+        }
+
+        const project = result.recordset.reduce((acc, row) => {
+            if (!acc) {
+                acc = {
+                    projectId: row.projectId,
+                    projectName: row.projectName,
+                    projectStyle: row.projectStyle,
+                    widgets: []
+                };
+            }
+
+            if (row.widgetId) {
+                acc.widgets.push({
+                    widgetId: row.widgetId,
+                    widgetName: row.widgetName,
+                    widgetCode: row.widgetCode,
+                    widgetNumber: row.widgetNumber
+                });
+            }
+
+            return acc;
+        }, null);
+
+        res.status(200).json(project);
+    } catch (err) {
+        console.error('Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
 
 module.exports = router;

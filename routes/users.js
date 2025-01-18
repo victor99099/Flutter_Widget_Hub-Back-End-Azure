@@ -2,11 +2,35 @@ const express = require('express');
 const session = require('express-session');
 require('dotenv').config();
 const { poolPromise, sql } = require('../db'); // Import DB connection
-
+const Redis = require('ioredis');
 const { ConfidentialClientApplication } = require('@azure/msal-node');
-
-
+const axios = require('axios');
+const cors = require('cors');
 const router = express.Router();
+
+const redisClient = new Redis({
+    host: '127.0.0.1', // Update with your Redis server host
+    port: 6379,        // Update with your Redis server port
+});
+
+router.use(cors({
+    origin: '*', // Allow all domains (for development)
+    methods: ['GET', 'POST', 'PUT', 'DELETE'], // Allow the methods you need
+    allowedHeaders: ['Content-Type', 'Authorization'], // Allow the headers you need
+    credentials: true,
+}));
+router.use(
+    session({
+        secret: 'your-secret-key',
+        resave: false,
+        saveUninitialized: false,
+        cookie: {
+            secure: false, // Set to true if using HTTPS
+            httpOnly: true,
+            sameSite: 'None', // Required for cross-origin
+        },
+    })
+);
 
 const msalConfig = {
     auth: {
@@ -30,10 +54,76 @@ router.use(
         saveUninitialized: true,
         cookie: {
             secure: false, // Set to true in production
-            maxAge: 24 * 60 * 60 * 1000, // 1 day
+            maxAge: 24 * 60 * 60 * 1000 * 10, // 1 day
         },
     })
 );
+
+async function setLoginStatus(email, status) {
+    const key = `login:${email}`;
+    await redisClient.set(key, status, 'EX', 3600); // Set login status with a 1-hour expiration
+}
+
+async function getLoginStatus(email) {
+    const key = `login:${email}`;
+    return await redisClient.get(key);
+}
+
+
+router.post('/google-signin', async (req, res) => {
+    const { accessToken } = req.body;
+
+    try {
+        // Verify Google access token
+        const response = await axios.get(`https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${accessToken}`);
+        const payload = response.data;
+
+        if (!payload || !payload.sub || !payload.email) {
+            return res.status(400).json({ error: 'Invalid access token' });
+        }
+
+        let email = payload.email;
+
+        // Check user in DB
+        const pool = await poolPromise;
+        const userCheck = await pool.request()
+            .input('email', sql.NVarChar, email)
+            .query('SELECT * FROM Users WHERE email = @email');
+
+        let userId;
+        let name = email.split('@')[0];
+        if (!userCheck.recordset.length) {
+            // Add new user if not exists
+            const result = await pool.request()
+                .input('name', sql.NVarChar, name)
+                .input('email', sql.NVarChar, email)
+                .input('password', sql.NVarChar, 'password')
+                .query('INSERT INTO Users (name, email, password) OUTPUT INSERTED.id VALUES (@name, @email, @password)');
+
+            userId = result.recordset[0].id;
+        } else {
+            // User exists, get their ID
+            userId = userCheck.recordset[0].id;
+            name = userCheck.recordset[0].name;
+        }
+
+        // Set login status in Redis
+        await setLoginStatus(email, 'loggedIn');
+        res.status(200).json({
+            message: 'Google Sign-in successful',
+            user: {
+                id: userId,
+                name: name,
+                email: email
+            }
+        });
+    } catch (error) {
+        console.error('Google Sign-in error:', error.message);
+        res.status(500).json({ error: `Google Sign-in error: ${error.message}` });
+    }
+});
+
+
 
 // Login route
 router.get('/Microsoftlogin', (req, res) => {
@@ -45,7 +135,7 @@ router.get('/Microsoftlogin', (req, res) => {
     msalClient
         .getAuthCodeUrl(authCodeUrlParameters)
         .then((response) => {
-            res.redirect(response);
+            res.status(200).json({ loginUrl: response });
         })
         .catch((error) => {
             console.error('Error getting auth code URL:', error);
@@ -53,7 +143,6 @@ router.get('/Microsoftlogin', (req, res) => {
         });
 });
 
-// Callback route
 // Callback route
 router.get('/Microsoftlogin/callback', async (req, res) => {
     const tokenRequest = {
@@ -70,11 +159,6 @@ router.get('/Microsoftlogin/callback', async (req, res) => {
         const name = response.account.name
         const accessToken = response.accessToken;
 
-        req.session.user = {
-            name,
-            email,
-            accessToken,
-        };
 
         try {
             const pool = await poolPromise;
@@ -92,10 +176,15 @@ router.get('/Microsoftlogin/callback', async (req, res) => {
                     .input('password', sql.NVarChar, 'password')
                     .query('INSERT INTO Users (name, email, password) OUTPUT INSERTED.id VALUES (@name, @email, @password)');
 
-                res.status(201).json({ message: 'User created successfully', userId: result.recordset[0].id });
+
+                req.session.user = {
+                    id: result.recordset[0].id, name: result.recordset[0].name, email: result.recordset[0].email
+                };
+                await setLoginStatus(email, 'loggedIn');
+                res.status(200).json({ message: 'User created successfully', user: { id: result.recordset[0].id, name: result.recordset[0].name, email: result.recordset[0].email }, });
             }
 
-            req.session.user = { email, name, accessToken };
+
         } catch (err) {
             console.error('Error during user login:', err);
             res.status(500).json({ error: 'Internal Server Error' });
@@ -108,39 +197,79 @@ router.get('/Microsoftlogin/callback', async (req, res) => {
     }
 });
 
-router.get('/check-session', (req, res) => {
-    if (req.session && req.session.user) {
-        res.status(200).json({
-            isloggedIn: true,
-            message: 'User is logged in',
-            user: req.session.user,
-        });
-    } else {
-        res.status(401).json({
-            isloggedIn: false,
-            message: 'User is not logged in',
-        });
+router.get('/check-session', async (req, res) => {
+    const email = req.query.email; // Email should be passed in the request
+
+    try {
+        const status = await getLoginStatus(email);
+
+        if (status === 'loggedIn') {
+            // Fetch user details from the database based on email
+            const pool = await poolPromise;
+            const userCheck = await pool.request()
+                .input('email', sql.NVarChar, email)
+                .query('SELECT id, name, email FROM Users WHERE email = @email');
+
+            if (userCheck.recordset.length > 0) {
+                // Send user details as JSON
+                const user = userCheck.recordset[0];
+                res.status(200).json({
+                    isLoggedIn: true,
+                    message: 'User is logged in',
+                    user: {
+                        id: user.id,
+                        name: user.name,
+                        email: user.email
+                    }
+                });
+            } else {
+                res.status(404).json({ isLoggedIn: false, message: 'User not found in the database' });
+            }
+        } else {
+            res.status(200).json({ isLoggedIn: false, message: 'User is not logged in' });
+        }
+    } catch (error) {
+        console.error('Error checking session:', error.message);
+        res.status(500).json({ error: 'Internal Server Error' });
     }
 });
 
 // Logout route
-router.get('/logout', (req, res) => {
-    req.session.destroy((err) => {
-        if (err) {
-            return res.status(500).json({ error: 'Failed to log out' });
-        }
+router.get('/logout', async (req, res) => {
+    const email = req.query.email; // Email should be passed in the request
 
-        const logoutUrl = `https://login.microsoftonline.com/common/oauth2/v2.0/logout?post_logout_redirect_uri=http://localhost:3000/`;
-        res.redirect(logoutUrl);
-    });
+    try {
+        // Clear login status in Redis
+        await redisClient.del(`login:${email}`);
+        res.status(200).json({ message: 'User logged out successfully' });
+    } catch (error) {
+        console.error('Logout error:', error.message);
+        res.status(500).json({ error: 'Failed to log out' });
+    }
 });
 
 
 // CREATE User
+function isValidEmail(email) {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
+}
+
 router.post('/create', async (req, res) => {
     const { name, email, password } = req.body;
+
+    // Validate email format
+    if (!isValidEmail(email)) {
+        return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Validate password length
+    if (!password || password.length < 8) {
+        return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+
     try {
-        const pool = await connect(); // Get the database connection pool
+        const pool = await poolPromise; // Get the database connection pool
 
         // Check if email exists
         const emailCheck = await pool.request()
@@ -158,7 +287,14 @@ router.post('/create', async (req, res) => {
             .input('password', sql.NVarChar, password)
             .query('INSERT INTO Users (name, email, password) OUTPUT INSERTED.id VALUES (@name, @email, @password)');
 
-        res.status(201).json({ message: 'User created successfully', userId: result.recordset[0].id });
+        res.status(200).json({
+            message: 'User created successfully',
+            user: {
+                id: result.recordset[0].id,
+                name: name,
+                email: email,
+            },
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -176,14 +312,14 @@ router.post('/signin', async (req, res) => {
             .query('SELECT * FROM Users WHERE email = @email');
 
         if (!userCheck.recordset.length) {
-            return res.status(400).json({ error: 'Invalid email or password' });
+            return res.status(400).json({ error: 'Email not found' });
         }
 
         const user = userCheck.recordset[0];
 
         // Check if the password matches (you should use a hashed password in production)
         if (user.password !== password) {
-            return res.status(400).json({ error: 'Invalid email or password' });
+            return res.status(400).json({ error: 'Password is incorrect' });
         }
 
         // Store the user in session (you can use a session middleware like express-session)
@@ -192,7 +328,7 @@ router.post('/signin', async (req, res) => {
             name: user.name,
             email: user.email,
         };
-
+        await setLoginStatus(email, 'loggedIn');
         // Return the user info and session data
         res.status(200).json({
             message: 'Login successful',
