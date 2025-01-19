@@ -5,6 +5,7 @@ const { poolPromise, sql } = require('../db'); // Import DB connection
 const Redis = require('ioredis');
 const { ConfidentialClientApplication } = require('@azure/msal-node');
 const axios = require('axios');
+const WebSocket = require('ws');
 const cors = require('cors');
 const router = express.Router();
 
@@ -123,14 +124,39 @@ router.post('/google-signin', async (req, res) => {
     }
 });
 
+const wss = new WebSocket.Server({ port: 8080 });
 
+wss.on('connection', (ws) => {
+    console.log('Frontend connected to WebSocket.');
+
+    // Send a connection confirmation message to the connected client
+    ws.send(JSON.stringify({ message: 'Connection established, waiting for login...' }));
+
+    // Handle messages from the frontend
+    ws.on('message', (message) => {
+        console.log('Received message from frontend:', message); // For debugging
+    });
+
+    // Log client disconnect
+    ws.on('close', () => {
+        console.log('Frontend disconnected from WebSocket.');
+    });
+
+    // Log errors
+    ws.on('error', (error) => {
+        console.error('WebSocket Error:', error);
+    });
+});
 
 // Login route
 router.get('/Microsoftlogin', (req, res) => {
     const authCodeUrlParameters = {
         scopes: ['user.read'],
-        redirectUri: 'http://localhost:3000/users/Microsoftlogin/callback/',
+        redirectUri: 'https://flutterhub.centralindia.cloudapp.azure.com/users/Microsoftlogin/callback/',
+        // redirectUri: 'http://localhost:3000/users/Microsoftlogin/callback',
     };
+
+
 
     msalClient
         .getAuthCodeUrl(authCodeUrlParameters)
@@ -148,12 +174,13 @@ router.get('/Microsoftlogin/callback', async (req, res) => {
     const tokenRequest = {
         code: req.query.code,
         scopes: ['user.read'],
-        redirectUri: 'http://localhost:3000/users/Microsoftlogin/callback/',
+        // redirectUri: 'http://localhost:3000/users/Microsoftlogin/callback',
+        redirectUri: 'https://flutterhub.centralindia.cloudapp.azure.com/users/Microsoftlogin/callback/',
     };
 
     try {
         const response = await msalClient.acquireTokenByCode(tokenRequest);
-        console.log('Authentication successful:', response.account);
+        // console.log('Authentication successful:', response.account);
 
         const email = response.account.username;
         const name = response.account.name
@@ -168,21 +195,35 @@ router.get('/Microsoftlogin/callback', async (req, res) => {
                 .input('email', sql.NVarChar, email)
                 .query('SELECT * FROM Users WHERE email = @email');
 
+            let user;
             if (!userCheck.recordset.length) {
-                // Create new user if not found, leaving password empty
+                // Create new user if not found
                 const result = await pool.request()
                     .input('name', sql.NVarChar, name)
                     .input('email', sql.NVarChar, email)
-                    .input('password', sql.NVarChar, 'password')
-                    .query('INSERT INTO Users (name, email, password) OUTPUT INSERTED.id VALUES (@name, @email, @password)');
+                    .input('password', sql.NVarChar, 'password') // Placeholder password
+                    .query('INSERT INTO Users (name, email, password) OUTPUT INSERTED.* VALUES (@name, @email, @password)');
 
-
-                req.session.user = {
-                    id: result.recordset[0].id, name: result.recordset[0].name, email: result.recordset[0].email
-                };
-                await setLoginStatus(email, 'loggedIn');
-                res.status(200).json({ message: 'User created successfully', user: { id: result.recordset[0].id, name: result.recordset[0].name, email: result.recordset[0].email }, });
+                user = result.recordset[0];
+            } else {
+                user = userCheck.recordset[0];
             }
+
+            req.session.user = {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+            };
+
+            await setLoginStatus(email, 'loggedIn');
+            console.log("before ws")
+            wss.clients.forEach((client) => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({ message: 'login Successful', user: user }));
+                }
+            });
+
+            res.status(200).json({ message: 'Login successful - Return to website', });
 
 
         } catch (err) {
@@ -190,7 +231,6 @@ router.get('/Microsoftlogin/callback', async (req, res) => {
             res.status(500).json({ error: 'Internal Server Error' });
         }
 
-        res.redirect('https://flutter-widget-hub-2f91d.web.app'); // Redirect to a secure page
     } catch (error) {
         console.error('Error acquiring token:', error);
         res.status(500).send('Error during callback');
